@@ -1,230 +1,206 @@
-## with visuals
 import tensorflow as tf
-from tensorflow.keras import layers
+from tensorflow.keras import layers, Model
 from tensorflow.keras.applications import VGG16
+import numpy as np
 import matplotlib.pyplot as plt
 
-import os
+#This is the improved CNN inspired by TCP handhsake, which replaces the regular CNNs. As seen in ablation study of the paper.
+class TCPCNN(layers.Layer):
+    def __init__(self, filters, kernel_size, strides=(1, 1), padding="same", activation="relu", **kwargs):
+        super(TCPCNN, self).__init__(**kwargs)
+        self.conv = layers.Conv2D(filters, kernel_size, strides=strides, padding=padding, activation=activation)
+        self.global_pool = layers.GlobalAveragePooling2D()
+        self.dense1 = layers.Dense(filters // 4, activation="relu")
+        self.dense2 = layers.Dense(filters, activation="sigmoid")
 
-class PositionalEncoding(tf.keras.layers.Layer):
     def call(self, inputs):
-        # Ensure inputs have the required dimensions
-        if len(inputs.shape) < 3:
-            raise ValueError(f"Expected inputs to have at least 3 dimensions (batch_size, seq_length, feature_dim), "
-                             f"but got shape {inputs.shape}.")
+        conv_output = self.conv(inputs)
+        channel_attention = self.global_pool(conv_output)
+        channel_attention = self.dense1(channel_attention)
+        channel_attention = self.dense2(channel_attention)
+        channel_attention = tf.expand_dims(tf.expand_dims(channel_attention, axis=1), axis=1)
+        prioritized_output = conv_output * channel_attention
+        return prioritized_output
 
+
+class PositionalEncoding(layers.Layer):
+    def call(self, inputs):
         seq_length = tf.shape(inputs)[1]
         feature_dim = tf.shape(inputs)[2]
-
-        # Generate position indices and angles
         positions = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
-        angles = 1.0 / tf.pow(10000.0, (2 * (tf.range(feature_dim // 2, dtype=tf.float32)) / tf.cast(feature_dim, tf.float32)))
-        angles = tf.expand_dims(angles, axis=0)
-
-        # Compute positional encodings
-        pos_encoding = tf.concat([tf.sin(positions * angles), tf.cos(positions * angles)], axis=-1)
-
-        batch_size = tf.shape(inputs)[0]
-        pos_encoding = pos_encoding[:seq_length, :feature_dim]  # Truncate or pad to match input dimensions
-        pos_encoding = tf.tile(pos_encoding[tf.newaxis, :, :], [batch_size, 1, 1])
-
-        return inputs + pos_encoding  # Add positional encodings to the input
-
-    def compute_output_shape(self, input_shape):
-        return input_shape
-
+        div_terms = tf.pow(10000.0, (2 * tf.range(feature_dim // 2, dtype=tf.float32) / tf.cast(feature_dim, tf.float32)))
+        angles = positions / div_terms
+        pos_encoding = tf.concat([tf.sin(angles), tf.cos(angles)], axis=-1)
+        return inputs + tf.expand_dims(pos_encoding, axis=0)
 
 
 def transformer_encoder(input_shape):
-    inputs = tf.keras.Input(shape=input_shape)
-    patches = layers.Conv2D(16, (4, 4), strides=(4, 4), activation="relu", kernel_initializer='he_normal')(inputs)
-    reshaped = layers.Reshape((-1, 16))(patches)  # Reshape to (batch_size, seq_length, feature_dim)
-    transformer_with_position = PositionalEncoding()(reshaped)
-    transformer = layers.MultiHeadAttention(num_heads=2, key_dim=8)(transformer_with_position, transformer_with_position)
-    transformer = layers.Add()([reshaped, transformer])
+    inputs = layers.Input(shape=input_shape)
+    patches = layers.Conv2D(16, (4, 4), strides=(4, 4), activation="relu", kernel_initializer="he_normal")(inputs)
+    reshaped = layers.Reshape((-1, 16))(patches)
+    encoded = PositionalEncoding()(reshaped)
+    attention_output = layers.MultiHeadAttention(num_heads=2, key_dim=8)(encoded, encoded)
+    residual = layers.Add()([reshaped, attention_output])
     output_shape = (input_shape[0] // 4, input_shape[1] // 4, 16)
-    transformer_output = layers.Reshape(output_shape)(transformer)
-    return tf.keras.Model(inputs, transformer_output, name="TransformerEncoder")
+    reshaped_back = layers.Reshape(output_shape)(residual)
+    return Model(inputs, reshaped_back, name="TransformerEncoder")
 
 
-
-# Auxiliary Autoencoder
 def auxiliary_autoencoder(input_shape):
-    inputs = tf.keras.Input(shape=input_shape)
-    x = layers.Conv2D(16, (3, 3), activation='relu', padding='same', kernel_initializer='he_normal')(inputs)
+    inputs = layers.Input(shape=input_shape)
+    x = TCPCNN(16, (3, 3))(inputs)
     x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same', kernel_initializer='he_normal')(x)
+    x = TCPCNN(32, (3, 3))(x)
     x = layers.MaxPooling2D()(x)
-    bottleneck = layers.Conv2D(64, (3, 3), activation='relu', padding='same', kernel_initializer='he_normal')(x)
+    bottleneck = TCPCNN(64, (3, 3))(x)
     x = layers.UpSampling2D()(bottleneck)
-    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same', kernel_initializer='he_normal')(x)
+    x = TCPCNN(32, (3, 3))(x)
     x = layers.UpSampling2D()(x)
-    outputs = layers.Conv2D(1, (3, 3), activation='tanh', padding='same')(x)
-    return tf.keras.Model(inputs, bottleneck, name="AuxiliaryAutoencoder")
+    outputs = layers.Conv2D(1, (3, 3), activation="tanh", padding="same")(x)
+    return Model(inputs, bottleneck, name="AuxiliaryAutoencoder")
 
 
-# GAN Generator
 def gan_generator(input_shape, transformer_output_shape, autoencoder_output_shape, target_shape=(64, 64)):
     grayscale_input = layers.Input(shape=input_shape)
     transformer_input = layers.Input(shape=transformer_output_shape)
     autoencoder_input = layers.Input(shape=autoencoder_output_shape)
 
-    # Resize grayscale input to match target shape (64, 64) to match transformer and autoencoder outputs
-    resize_grayscale = layers.Lambda(lambda x: tf.image.resize(x, target_shape),
-                                     output_shape=(target_shape[0], target_shape[1], input_shape[-1]))(grayscale_input)
+    resize = layers.Lambda(lambda x: tf.image.resize(x, target_shape))
+    resized_grayscale = resize(grayscale_input)
+    transformer_resized = resize(transformer_input)
+    autoencoder_resized = resize(autoencoder_input)
 
-    # Apply Conv2D to increase depth of transformer and autoencoder inputs
-    transformer_depth_increased = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(transformer_input)
-    autoencoder_depth_increased = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(autoencoder_input)
-
-    # Resize transformer and autoencoder outputs to match target shape (64, 64) for concatenation
-    resize_layer = layers.Lambda(lambda x: tf.image.resize(x, target_shape),
-                                 output_shape=(target_shape[0], target_shape[1], 64))
-
-    transformer_resized = resize_layer(transformer_depth_increased)
-    autoencoder_resized = resize_layer(autoencoder_depth_increased)
-
-    # Concatenate grayscale input (now resized) with resized transformer and autoencoder inputs
-    concatenated = layers.Concatenate()([resize_grayscale, transformer_resized, autoencoder_resized])
-
-    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same', kernel_initializer='he_normal')(concatenated)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same', kernel_initializer='he_normal')(x)
-    x = layers.BatchNormalization()(x)
-
-    rgb_output = layers.Conv2D(3, (3, 3), activation='tanh', padding='same')(x)
-
-    return tf.keras.Model([grayscale_input, transformer_input, autoencoder_input], rgb_output, name="GANGenerator")
+    concatenated = layers.Concatenate()([resized_grayscale, transformer_resized, autoencoder_resized])
+    x = TCPCNN(64, (3, 3))(concatenated)
+    x = TCPCNN(32, (3, 3))(x)
+    outputs = layers.Conv2D(3, (3, 3), activation="tanh", padding="same")(x)
+    return Model([grayscale_input, transformer_input, autoencoder_input], outputs, name="GANGenerator")
 
 
-# GAN Discriminator
 def gan_discriminator(input_shape):
-    inputs = tf.keras.Input(shape=input_shape)
-    x = layers.Conv2D(64, (3, 3), strides=(2, 2), activation='relu')(inputs)
-    x = layers.Conv2D(128, (3, 3), strides=(2, 2), activation='relu')(x)
+    inputs = layers.Input(shape=input_shape)
+    x = TCPCNN(64, (3, 3), strides=(2, 2))(inputs)
+    x = TCPCNN(128, (3, 3), strides=(2, 2))(x)
     x = layers.Flatten()(x)
-    x = layers.Dense(1, activation='sigmoid')(x)
-    return tf.keras.Model(inputs, x, name="GANDiscriminator")
+    outputs = layers.Dense(1, activation="sigmoid")(x)
+    return Model(inputs, outputs, name="GANDiscriminator")
 
-def save_model_with_custom_layers(model, filepath):
-    model.save(filepath, save_format="h5")
+# Metrics Calculation
+@tf.function
+def calculate_metrics(y_true, y_pred):
+    psnr = tf.image.psnr(y_true, y_pred, max_val=1.0)
+    ssim = tf.image.ssim(y_true, y_pred, max_val=1.0)
+    mae = tf.reduce_mean(tf.abs(y_true - y_pred))
+    return tf.reduce_mean(psnr), tf.reduce_mean(ssim), mae
 
-def load_model_with_custom_layers(filepath):
-    return tf.keras.models.load_model(filepath, custom_objects={
-        "PositionalEncoding": PositionalEncoding,
-        "tf": tf
-    })
-
-
-if __name__ == "__main__":
-    input_shape = (128, 128, 1)
-    model = transformer_encoder(input_shape)
-    save_model_with_custom_layers(model, "transformer_encoder.h5")
-    loaded_model = load_model_with_custom_layers("transformer_encoder.h5")
-    print(loaded_model.summary())
-
-
-# Pre-trained VGG16 for Perceptual Loss
+# Load Pre-trained VGG for Perceptual Loss
 vgg = VGG16(include_top=False, weights="imagenet", input_shape=(64, 64, 3))
-for layer in vgg.layers:
-    layer.trainable = False
+vgg.trainable = False
 
-
-# Loss Functions
-def perceptual_loss(y_true, y_pred):
-    y_true_vgg = vgg(y_true)
-    y_pred_vgg = vgg(y_pred)
-    mse_loss = tf.reduce_mean(tf.square(y_true - y_pred))
-    perceptual_loss = tf.reduce_mean(tf.abs(y_true_vgg - y_pred_vgg))
-    return mse_loss + 0.25 * perceptual_loss
-
-
-def discriminator_loss(y_true, y_pred):
-    return tf.keras.losses.BinaryCrossentropy(from_logits=False)(y_true, y_pred)
-
-
-def generator_loss(y_pred):
-    return tf.keras.losses.BinaryCrossentropy(from_logits=False)(tf.ones_like(y_pred), y_pred)
-
-
-def psnr_metric(y_true, y_pred):
-    return tf.image.psnr(y_true, y_pred, max_val=1.0)
-
-
-# Initialize Models
+# Model Initialization
 IMG_HEIGHT, IMG_WIDTH = 64, 64
 input_shape = (IMG_HEIGHT, IMG_WIDTH, 1)
 
-transformer_encoder_model = transformer_encoder(input_shape)
-autoencoder_model = auxiliary_autoencoder(input_shape)
-transformer_output_shape = transformer_encoder_model.output_shape[1:]
-autoencoder_output_shape = autoencoder_model.output_shape[1:]
+transformer = transformer_encoder(input_shape)
+autoencoder = auxiliary_autoencoder(input_shape)
+generator = gan_generator(input_shape, transformer.output_shape[1:], autoencoder.output_shape[1:])
+discriminator = gan_discriminator((IMG_HEIGHT, IMG_WIDTH, 3))
 
-gan_generator_model = gan_generator(input_shape, transformer_output_shape, autoencoder_output_shape)
-gan_discriminator_model = gan_discriminator((IMG_HEIGHT, IMG_WIDTH, 3))
-
-lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-    initial_learning_rate=2e-4, decay_steps=1000, decay_rate=0.96
-)
+# Optimizers with Learning Rate Schedule
+lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=1e-4, decay_steps=1000, decay_rate=0.95)
 optimizer_g = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 optimizer_d = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
-SAVE_DIR = "./saved_models"
-try:
-    os.makedirs(SAVE_DIR, exist_ok=True)
-except OSError as e:
-    print(f"Error creating save directory {SAVE_DIR}: {e}")
+@tf.function
+@tf.function
+def train_step(grayscale, rgb, transformer, autoencoder, generator, discriminator, optimizer_g, optimizer_d, vgg):
+    with tf.GradientTape(persistent=True) as tape:
+        transformer_output = transformer(grayscale, training=True)
+        autoencoder_output = autoencoder(grayscale, training=True)
+        generated_rgb = generator([grayscale, transformer_output, autoencoder_output], training=True)
 
-def compile_and_save_model(model, optimizer, loss_function, save_path):
-    model.compile(optimizer=optimizer, loss=loss_function)
-    model.save(save_path)
+        real_output = discriminator(rgb, training=True)
+        fake_output = discriminator(generated_rgb, training=True)
 
-def show_generated_image(image_tensor, epoch, step):
-    image = (image_tensor[0].numpy() * 0.5 + 0.5)  # Assuming images are normalized in the range [-1, 1]
-    plt.imshow(image)
-    plt.axis('off')
-    plt.title(f"Epoch {epoch + 1}, Step {step}")
-    plt.show()
+        real_features = vgg(rgb)
+        fake_features = vgg(generated_rgb)
 
-def train_model(dataset, epochs=5):
+        perceptual_loss = tf.reduce_mean(tf.abs(real_features - fake_features))
+        color_loss = tf.reduce_mean(tf.abs(rgb[:, :, :, 1:] - generated_rgb[:, :, :, 1:]))
+        adv_loss_g = tf.reduce_mean(tf.keras.losses.binary_crossentropy(tf.ones_like(fake_output), fake_output))
+        g_loss = adv_loss_g + 0.5 * perceptual_loss + 0.5 * color_loss
+
+        real_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(tf.ones_like(real_output), real_output))
+        fake_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(tf.zeros_like(fake_output), fake_output))
+        d_loss = (real_loss + fake_loss) / 2
+
+        psnr = tf.image.psnr(rgb, generated_rgb, max_val=1.0)
+        ssim = tf.image.ssim(rgb, generated_rgb, max_val=1.0)
+        mae = tf.reduce_mean(tf.abs(rgb - generated_rgb))
+
+    gradients_g = tape.gradient(g_loss, generator.trainable_variables)
+    optimizer_g.apply_gradients(zip(gradients_g, generator.trainable_variables))
+
+    gradients_d = tape.gradient(d_loss, discriminator.trainable_variables)
+    optimizer_d.apply_gradients(zip(gradients_d, discriminator.trainable_variables))
+
+    del tape
+    return d_loss, g_loss, tf.reduce_mean(psnr), tf.reduce_mean(ssim), mae, generated_rgb
+
+
+def train_model(transformer, autoencoder, generator, discriminator, optimizer_g, optimizer_d, vgg, dataset, epochs=1, steps_per_epoch=None):
     for epoch in range(epochs):
-        print(f"\nEpoch {epoch + 1}/{epochs}")
+        print(f"Epoch {epoch + 1}/{epochs}")
+        metrics = {'d_loss': [], 'g_loss': [], 'psnr': [], 'ssim': [], 'mae': []}
         for step, (grayscale, rgb) in enumerate(dataset):
-            if grayscale.shape[-1] != 1:
-                grayscale = tf.expand_dims(grayscale, axis=-1)
-            transformer_features = transformer_encoder_model(grayscale)
-            autoencoder_features = autoencoder_model(grayscale)
+            d_loss, g_loss, psnr, ssim, mae, generated_rgb = train_step(
+                grayscale, rgb, transformer, autoencoder, generator, discriminator, optimizer_g, optimizer_d, vgg
+            )
+            metrics['d_loss'].append(d_loss.numpy())
+            metrics['g_loss'].append(g_loss.numpy())
+            metrics['psnr'].append(psnr.numpy())
+            metrics['ssim'].append(ssim.numpy())
+            metrics['mae'].append(mae.numpy())
 
-            # Train discriminator
-            with tf.GradientTape() as tape_d:
-                fake_images = gan_generator_model([grayscale, transformer_features, autoencoder_features])
-                real_output = gan_discriminator_model(rgb)
-                fake_output = gan_discriminator_model(fake_images)
-                d_loss_real = discriminator_loss(tf.ones_like(real_output), real_output)
-                d_loss_fake = discriminator_loss(tf.zeros_like(fake_output), fake_output)
-                d_loss = d_loss_real + d_loss_fake
-
-            grads_d = tape_d.gradient(d_loss, gan_discriminator_model.trainable_variables)
-            optimizer_d.apply_gradients(zip(grads_d, gan_discriminator_model.trainable_variables))
-
-            # Train generator
-            with tf.GradientTape() as tape_g:
-                fake_images = gan_generator_model([grayscale, transformer_features, autoencoder_features])
-                fake_output = gan_discriminator_model(fake_images)
-                g_loss = generator_loss(fake_output) + perceptual_loss(rgb, fake_images)
-                psnr = psnr_metric(rgb, fake_images)  # Calculate PSNR
-
-            grads_g = tape_g.gradient(g_loss, gan_generator_model.trainable_variables)
-            optimizer_g.apply_gradients(zip(grads_g, gan_generator_model.trainable_variables))
-
-            #generated image every 10 steps
             if step % 10 == 0:
-                print(f"Step {step}: D Loss = {d_loss:.4f}, G Loss = {g_loss:.4f}, PSNR = {tf.reduce_mean(psnr):.2f}")
-                show_generated_image(fake_images, epoch, step)
+                print(f"Step {step}: D Loss = {d_loss:.4f}, G Loss = {g_loss:.4f}, PSNR = {psnr:.2f}, SSIM = {ssim:.2f}, MAE = {mae:.4f}")
 
-        compile_and_save_model(gan_generator_model, optimizer_g, generator_loss, os.path.join(SAVE_DIR, f"gan_generator_epoch_{epoch + 1}.h5"))
-        compile_and_save_model(gan_discriminator_model, optimizer_d, discriminator_loss, os.path.join(SAVE_DIR, f"gan_discriminator_epoch_{epoch + 1}.h5"))
-        print(f"Models saved for epoch {epoch + 1}.")
+            if steps_per_epoch and step >= steps_per_epoch - 1:
+                break
 
-# Call the training function
-train_model(dataset, epochs=5)
+        avg_d_loss = np.mean(metrics['d_loss'])
+        avg_g_loss = np.mean(metrics['g_loss'])
+        avg_psnr = np.mean(metrics['psnr'])
+        avg_ssim = np.mean(metrics['ssim'])
+        avg_mae = np.mean(metrics['mae'])
+
+        print(f"Epoch {epoch + 1} Summary:")
+        print(f"  Avg D Loss = {avg_d_loss:.4f}")
+        print(f"  Avg G Loss = {avg_g_loss:.4f}")
+        print(f"  Avg PSNR = {avg_psnr:.2f}")
+        print(f"  Avg SSIM = {avg_ssim:.2f}")
+        print(f"  Avg MAE = {avg_mae:.4f}")
+
+        # Visualize RGB, Grayscale, and Generated images
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        axes[0].imshow(rgb[0].numpy())
+        axes[0].set_title("RGB")
+        axes[1].imshow(grayscale[0].numpy().squeeze(), cmap="gray")
+        axes[1].set_title("Grayscale")
+        axes[2].imshow((generated_rgb[0].numpy() * 0.5 + 0.5))  # Denormalize for visualization
+        axes[2].set_title("Generated")
+        plt.show()
+
+dataset = load_paired_dataset(grayscale_dir, rgb_dir, batch_size=BATCH_SIZE)
+train_model(
+    transformer=transformer,
+    autoencoder=autoencoder,
+    generator=generator,
+    discriminator=discriminator,
+    optimizer_g=optimizer_g,
+    optimizer_d=optimizer_d,
+    vgg=vgg,
+    dataset=dataset,
+    epochs=70,
+    steps_per_epoch=94
+)
