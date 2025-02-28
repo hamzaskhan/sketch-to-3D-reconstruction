@@ -90,7 +90,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Real-ESRGAN**: Wang, X., et al. (2021). Real-ESRGAN: Training Real-World Super-Resolution with Realistic Examples. ECCV.
 - **DeOldify**: Antic, J. (2020). DeOldify: Bringing Color to the Past. GitHub.
 - **ShapE**: Saharia, C., et al. (2023). ShapE: Generative Shape-Aware Image-to-Image Translation. NeurIPS.
-- **Midas**: (If you are using the Midas depth estimation model, add the reference here as well).
+- **Midas**
 
 
 
